@@ -1,0 +1,2 @@
+polymarket-client==0.13.0
+websockets>=13
