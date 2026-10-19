@@ -42,7 +42,7 @@ class Params:
     stop_secs: int = 5               # cancel everything this long before close
     improve: bool = True             # step one tick inside the spread when possible
     taker_hedge: bool = True         # complete a naked position at the ask when the pair still fits the cap
-    taker_fee_pct: float = 2.0       # taker fee as % of taker notional; 0 disables the taker hedge
+    taker_fee_rate: float = 0.07     # Polymarket crypto taker fee: rate * p * (1 - p) USDC per share (3.5% of notional at 0.50)
 
 
 @dataclass
@@ -190,6 +190,15 @@ def quote_size(px, lead, params):
     return max(params.order_shares, float(math.ceil(params.order_usd / px - EPS)))
 
 
+def taker_fee(price, params):
+    """Taker fee per share at `price` (docs.polymarket.com/polymarket-learn/trading/fees): rate * p * (1 - p).
+
+    As a share of notional that is rate * (1 - p): 7% * 0.5 = 3.5% at 0.50 but 4.9% at 0.30,
+    so a flat percentage under-charged exactly the cheap hedges this bot takes.
+    """
+    return params.taker_fee_rate * price * (1 - price)
+
+
 def taker_hedge(tops, inv, params):
     """(outcome, max_price, shares) to buy at the ask now, or (None, reason).
 
@@ -197,7 +206,7 @@ def taker_hedge(tops, inv, params):
     The locked margin is thinner than a resting hedge's, but it is certain; 44% of live windows
     ended with no hedge at all and those carried the whole loss.
     """
-    if not params.taker_hedge or params.taker_fee_pct <= 0:
+    if not params.taker_hedge:
         return None, "off"
     lead = inv.shares["Up"] - inv.shares["Down"]
     if abs(lead) <= EPS:
@@ -206,7 +215,7 @@ def taker_hedge(tops, inv, params):
     _, ask = tops.get(lagging, (None, None))
     if ask is None:
         return None, "no_book"
-    all_in = ask * (1 + params.taker_fee_pct / 100)
+    all_in = ask + taker_fee(ask, params)
     if inv.avg(leading) + all_in > params.pair_cap + EPS:
         return None, "too_dear"
     shares = max(params.order_shares, float(math.ceil(abs(lead) - EPS)))

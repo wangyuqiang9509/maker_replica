@@ -61,11 +61,10 @@ one. If the inequality fails, keep the resting hedge bid and stop adding to the 
 pays the fee and the spread to lock a loss the leftover only has a 24% chance of
 recovering.
 
-Fee: the reference wallet paid 0.62% of all notional in taker fees with 31% of its
-notional taken, so about 2% of taker notional. Use `MR_TAKER_FEE_PCT` (default 2.0) until
-the exact schedule for 5m crypto markets is confirmed from the first live taker fill
-(the user stream reports the fee per trade). The hedge is skipped when the fee tier is
-unknown and `MR_TAKER_FEE_PCT` is 0.
+Fee: Polymarket's crypto taker fee is `0.07 × p × (1 − p)` per share (3.5% of notional at
+0.50, 2.1% at 0.70, 4.9% at 0.30). The reference wallet paid about 2% of its taker notional,
+consistent with taking mostly the dear side. `MR_TAKER_FEE_RATE` (default 0.07) sets the
+rate; `MR_TAKER_HEDGE=0` disables the hedge.
 
 SDK: `place_limit_order(..., post_only=False)` at the ask price with the FAK order type
 (check the 0.13 client for the `order_type` argument; if only GTC exists, place at the ask
@@ -117,6 +116,12 @@ commit, rather than from the leftover win rate:
    (3 windows, about −$4). Down filled 7 @ 0.41, fell to 0.32, and 7 × 0.32 = 2.24 < 2.5
    allowed 8 more @ 0.32; Up was too dear to hedge and 15 shares lost. Fix: imbalance is
    `lead × average cost` (7 × 0.41 = 2.87 blocks the second order).
+
+After the deploy (10:45 on) the taker hedge and the resting hedge bid both filled in the same
+second once (10:50: the price fell through the resting bid as the FAK bought), so the taker
+path now cancels the resting bid first and skips the take when the cancel reports it matched.
+The taker fee is also modelled on the official curve (`0.07 × p × (1 − p)` per share) instead
+of a flat 2%, which under-charged cheap hedges by about a cent.
 
 One fill was not the bot's: a sell of 17 Up @ 0.21 at 09:02:48 turned that window's pair
 cost into 1.14. The bot never sells; keep other tools off the account while it runs.

@@ -192,6 +192,31 @@ class SpotPullTests(EngineTests):
             self.assertNotIn("take", [c[0] for c in self.ex.calls])
         run(go())
 
+    def test_take_cancels_the_resting_hedge_bid_first(self):
+        async def go():
+            w = self.window(up=(0.60, 0.62), down=(0.28, 0.30))
+            self.bot.windows[w.m["slug"]] = w
+            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 5.0, 0.64, "maker")
+            self.ex.orders["h1"] = {"market": "0xc", "outcome": "Down", "price": 0.28, "size": 5, "ts": 0}
+            await self.bot.reconcile(w, time.time())
+            self.assertEqual(self.ex.calls[:2], [("cancel", ["h1"]), ("take", "Down", 0.30, 5)])
+            self.assertNotIn(("place", "Down", 0.28), self.ex.calls)   # nothing re-posted until the fill is known
+            self.assertEqual(self.events("take")[0]["cancelled"], ["h1"])
+        run(go())
+
+    def test_take_skipped_when_the_hedge_bid_just_matched(self):
+        async def go():
+            w = self.window(up=(0.60, 0.62), down=(0.28, 0.30))
+            self.bot.windows[w.m["slug"]] = w
+            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 5.0, 0.64, "maker")
+            self.ex.orders["h1"] = {"market": "0xc", "outcome": "Down", "price": 0.28, "size": 5, "ts": 0}
+            self.ex.not_canceled["h1"] = "matched"
+            await self.bot.reconcile(w, time.time())
+            self.assertNotIn("take", [c[0] for c in self.ex.calls])
+            self.assertEqual(self.events("take")[0]["error"], "resting bid already matched")
+            self.assertEqual(w.last_sync, 0.0)                              # sync now: the fill is on its way
+        run(go())
+
     def test_btc_pull_leaves_the_hedge_bid_alone(self):
         async def go():
             w = self.window(up=(0.49, 0.51), down=(0.49, 0.51))

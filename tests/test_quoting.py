@@ -115,7 +115,7 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(out['Up'], (0.77, 'ok'))
         self.assertEqual(sizes['Up'], 12)                      # floor((12 - 2.6) / 0.77)
         take, why = q.taker_hedge({'Up': (0.73, 0.75), 'Down': (0.20, 0.22)}, inv, P)
-        self.assertEqual((take, why), (('Up', 0.75, 12), 'ok'))   # floor(9.4 / (0.75 * 1.02))
+        self.assertEqual((take, why), (('Up', 0.75, 12), 'ok'))   # floor(9.4 / (0.75 + 0.07 * 0.75 * 0.25))
 
     def test_budget_uses_the_dollar_size(self):
         inv = q.Inventory()
@@ -130,14 +130,18 @@ class TakerHedgeTests(unittest.TestCase):
         inv = q.Inventory()
         inv.add('Up', 'BUY', 5, 0.64)                          # live 05:40: Up naked, Down ask 0.30
         take, why = q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.28, 0.30)}, inv, P)
-        self.assertEqual((take, why), (('Down', 0.30, 5), 'ok'))  # 0.64 + 0.30 * 1.02 = 0.946
+        self.assertEqual((take, why), (('Down', 0.30, 5), 'ok'))  # 0.64 + 0.30 + 0.07 * 0.30 * 0.70 = 0.955
 
     def test_fee_can_push_the_pair_over_the_cap(self):
         inv = q.Inventory()
         inv.add('Up', 'BUY', 5, 0.64)
         self.assertEqual(q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.31, 0.33)}, inv, P)[1], 'too_dear')
-        p0 = q.Params(taker_fee_pct=0)
-        self.assertEqual(q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.31, 0.33)}, inv, p0)[1], 'off')
+        self.assertEqual(q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.31, 0.33)}, inv, q.Params(taker_hedge=False))[1], 'off')
+
+    def test_fee_follows_the_official_curve(self):
+        self.assertAlmostEqual(q.taker_fee(0.50, P), 0.0175)             # 3.5% of 0.50
+        self.assertAlmostEqual(q.taker_fee(0.30, P), 0.0147)             # 4.9% of 0.30: a flat 2% was too kind
+        self.assertAlmostEqual(q.taker_fee(0.30, q.Params(taker_fee_rate=0)), 0.0)
 
     def test_level_or_unaffordable_does_not_take(self):
         inv = q.Inventory()

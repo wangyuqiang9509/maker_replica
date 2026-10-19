@@ -31,7 +31,9 @@ It is separate from the momentum bot in the repository root and shares no code w
   `MR_MAX_MARKET_USD`. A leading bid is never larger than what the remaining budget can
   still hedge (`MR_PAIR_CAP` per share), so the hedge leg is not cut short by the budget.
 - Completes a naked side at the ask (FAK taker order) whenever
-  `avg(leading) + ask × (1 + MR_TAKER_FEE_PCT/100) <= MR_PAIR_CAP`. Never sells.
+  `avg(leading) + ask + MR_TAKER_FEE_RATE × ask × (1 − ask) <= MR_PAIR_CAP` (Polymarket's
+  crypto taker fee curve, 0.07). The resting hedge bid is cancelled first; if the CLOB reports
+  it already matched, the taker order is not sent. Never sells.
   See `PROPOSAL.md` for the live numbers behind these two rules.
 - Re-prices on every streamed book update (see Latency).
 - Cancels everything `MR_STOP_SECS` before close, holds to settlement, and redeems through

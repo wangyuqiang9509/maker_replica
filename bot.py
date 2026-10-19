@@ -69,7 +69,7 @@ def load_params():
         stop_secs=int(env_float("MR_STOP_SECS", d.stop_secs)),
         improve=os.getenv("MR_IMPROVE", "1") != "0",
         taker_hedge=os.getenv("MR_TAKER_HEDGE", "1") != "0",
-        taker_fee_pct=env_float("MR_TAKER_FEE_PCT", d.taker_fee_pct),
+        taker_fee_rate=env_float("MR_TAKER_FEE_RATE", d.taker_fee_rate),
     )
 
 
@@ -676,13 +676,27 @@ class Bot:
             if take:
                 outcome, ask, shares = take
                 t0 = time.perf_counter()
-                oid, err = await self.ex.take(m, outcome, ask, shares, w.books[outcome].asks)
+                # The resting hedge bid on this side comes down first: live 10:50 the price fell
+                # through it in the same second the FAK bought, and the window was hedged twice.
+                # A cancel the CLOB refuses means that bid just matched: its fill is on its way.
+                mine = [oid for oid, o in resting.items() if o["outcome"] == outcome]
+                kept = (await self.ex.cancel(mine) if mine else None) or {}
+                for oid in mine:
+                    resting.pop(oid, None)
+                if kept:
+                    self.j.log("cancel_failed", market=m["slug"], orders=kept, where="take")
+                    w.last_sync = 0.0
+                    oid, err = None, "resting bid already matched"
+                else:
+                    oid, err = await self.ex.take(m, outcome, ask, shares, w.books[outcome].asks)
                 # Live fills stream in within a second; the retry waits past one REST sync so a
                 # fill that has not streamed yet cannot be hedged twice. Rejections back off longer.
-                w.next_take = now + (TAKE_RETRY_SECS if oid else TAKE_REJECT_SECS)
+                w.next_take = now + (TAKE_RETRY_SECS if oid or kept else TAKE_REJECT_SECS)
                 self.j.log("take", market=m["slug"], outcome=outcome, max_price=ask, size=shares,
                            order_id=oid, error=err, pair=round((inv.avg(q.other(outcome)) or 0) + ask, 4),
-                           ms=round((time.perf_counter() - t0) * 1000))
+                           cancelled=mine, ms=round((time.perf_counter() - t0) * 1000))
+                # No new bid on this side until the fill (or its absence) is known.
+                targets = dict(targets, **{outcome: (None, "taking")})
                 if oid and not self.ex.live:
                     fills = self.ex.fills[m["condition_id"]]
                     self.record_fills(m, {k: v for k, v in fills.items() if k[0] == oid})
