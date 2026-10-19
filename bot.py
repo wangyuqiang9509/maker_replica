@@ -276,10 +276,13 @@ class Live:
         return r.order_id, None
 
     async def cancel(self, order_ids):
-        # Forget them either way; the next REST sync re-adopts any order that is still open.
-        for oid in order_ids:
-            self.orders.pop(oid, None)
-        await self.c.cancel_orders(order_ids=list(order_ids))
+        """Returns {order_id: reason} for orders the CLOB reports it did not cancel."""
+        saved = {oid: self.orders.pop(oid) for oid in order_ids if oid in self.orders}
+        r = await self.c.cancel_orders(order_ids=list(order_ids))
+        kept = {oid: why for oid, why in (getattr(r, "not_canceled", None) or {}).items() if oid in saved}
+        # Keep managing them (ts=0): an immediate sync drops the ones that were already matched or gone.
+        self.orders.update({oid: dict(saved[oid], ts=0.0) for oid in kept})
+        return kept
 
     async def cancel_all(self):
         self.orders.clear()
@@ -406,14 +409,15 @@ class Bot:
         await self.shutdown()
 
     async def shutdown(self):
+        for w in list(self.windows.values()):
+            await self.close_window(w, "shutdown")
         try:
+            # After the quote loops are gone: also catches a bid whose placement was still in flight.
             await self.ex.cancel_all()
             if self.ex.live:
                 self.j.log("cancel_all", reason="shutdown")
         except Exception as e:  # noqa: BLE001
             self.j.log("cancel_all_error", error=repr(e)[:300])
-        for w in list(self.windows.values()):
-            await self.close_window(w, "shutdown")
         self.j.log("stopping", pending_settlements=len(self.settling))
         if self.settling:
             await asyncio.gather(*list(self.settling), return_exceptions=True)
@@ -531,12 +535,26 @@ class Bot:
         """Fair-value move of this window implied by BTC's move over the pull window."""
         return q.fair_move(self.spot.range_ref(), self.spot.price, w.mid_up(), w.m["end"] - now, self.ss.vol)
 
+    def hedge_side(self, m):
+        """The lagging outcome, if any. Its bid completes pairs at a locked cost, so a BTC move
+        cannot hurt it; the reference wallet's whole edge is in completed pairs (one-sided leftovers
+        lose), and its hedge fills a median 21s after the first leg, i.e. on the BTC reversal that
+        would otherwise trigger a pull."""
+        inv = q.inventory_from(self.ex.fills[m["condition_id"]])
+        lead = inv.shares["Up"] - inv.shares["Down"]
+        return "Down" if lead > q.EPS else "Up" if lead < -q.EPS else None
+
+    def exposed_orders(self, m):
+        """Resting bids that would add one-sided exposure if filled."""
+        hedge = self.hedge_side(m)
+        return [oid for oid, o in self.ex.market_orders(m).items() if o["outcome"] != hedge]
+
     def on_spot(self, price):
         now = time.time()
         for w in list(self.windows.values()):
             if w.closed or w.pulling:
                 continue
-            if not self.ex.market_orders(w.m):
+            if not self.exposed_orders(w.m):
                 continue
             move = self.btc_move(w, now)
             if move >= self.ss.pull_ticks * w.tick - q.EPS:
@@ -544,16 +562,19 @@ class Bot:
                 asyncio.get_running_loop().create_task(self.pull(w, move, price))
 
     async def pull(self, w, move, price):
-        """Cancel every bid in the window now; the book has not caught up with BTC yet."""
+        """Cancel the window's exposed bids now; the book has not caught up with BTC yet."""
         try:
             w.pulled_until = time.time() + self.ss.cooldown
-            ids = list(self.ex.market_orders(w.m))
+            ids = self.exposed_orders(w.m)
             if ids:
                 t0 = time.perf_counter()
                 spot_age_ms = round(time.time() * 1000 - self.spot.event_ms) if self.spot.event_ms else None
-                await self.ex.cancel(ids)
+                kept = await self.ex.cancel(ids)
                 self.j.log("pull", market=w.m["slug"], orders=ids, fair_move=round(move, 4), spot=price,
                            spot_age_ms=spot_age_ms, ms=round((time.perf_counter() - t0) * 1000))
+                if kept:
+                    self.j.log("cancel_failed", market=w.m["slug"], orders=kept)
+                    w.last_sync = 0.0
         except Exception as e:  # noqa: BLE001
             self.j.log("error", where="pull", market=w.m["slug"], error=repr(e)[:300])
         finally:
@@ -599,12 +620,19 @@ class Bot:
             # Live bids are in the streamed book; remove them so we never quote against ourselves.
             tops[o] = b.top(own[o] if self.ex.live else None) if b.ready else (None, None)
         targets = q.compute_quotes(tops, w.tick, inv, self.p, m["end"] - now, now - m["start"], committed)
+        lead = inv.shares["Up"] - inv.shares["Down"]
+        hedge = "Down" if lead > q.EPS else "Up" if lead < -q.EPS else None
         if now < w.pulled_until or w.pulling:
-            targets = {o: (None, "pulled") for o in targets}
+            block = "pulled"
         elif not self.spot.fresh(self.ss.stale_secs):
-            targets = {o: (None, "no_spot") for o in targets}
+            block = "no_spot"
         elif self.btc_move(w, now) >= self.ss.pull_ticks * w.tick - q.EPS:
-            targets = {o: (None, "btc_moving") for o in targets}
+            block = "btc_moving"
+        else:
+            block = None
+        if block:
+            # BTC risk only applies to bids that add one-sided exposure; the hedge bid stays.
+            targets = {o: (t if o == hedge else (None, block)) for o, t in targets.items()}
         if targets != w.last_targets:
             w.last_targets = targets
             self.j.log("quote", market=m["slug"], tops=tops, targets=targets, shares=inv.shares, cost=inv.cost)
@@ -619,8 +647,13 @@ class Bot:
         if stale:
             # Protective step first: pull stale bids in one request before posting new ones.
             t0 = time.perf_counter()
-            await self.ex.cancel([oid for oid, _, _ in stale])
+            kept = await self.ex.cancel([oid for oid, _, _ in stale])
             self.j.log("cancel", market=m["slug"], orders=stale, ms=round((time.perf_counter() - t0) * 1000))
+            if kept:
+                # Still open per the CLOB: do not post next to them; sync on the next pass to learn their state.
+                self.j.log("cancel_failed", market=m["slug"], orders=kept)
+                w.last_sync = 0.0
+                return
         if places and (time.time() < w.pulled_until or w.pulling):
             places = []  # a pull started while we were cancelling
         if places:
@@ -633,6 +666,13 @@ class Bot:
                                order_id=oid, ms=ms)
                 else:
                     self.j.log("reject", market=m["slug"], outcome=outcome, price=px, error=err, ms=ms)
+            placed = [oid for (o, _), (oid, _) in zip(places, results) if oid and o != hedge]
+            if placed and (time.time() < w.pulled_until or w.pulling):
+                # A pull fired during the round trip and could not see these yet: take them down now.
+                t0 = time.perf_counter()
+                await self.ex.cancel(placed)
+                self.j.log("pull", market=m["slug"], orders=placed, late=True,
+                           ms=round((time.perf_counter() - t0) * 1000))
 
     # --- closing and settlement ---
 
@@ -644,11 +684,17 @@ class Bot:
         self.windows.pop(m["slug"], None)
         self.done.add(m["slug"])
         resting = list(self.ex.market_orders(m))
-        if resting:
+        for attempt in range(2):
+            if not resting:
+                break
             try:
-                await self.ex.cancel(resting)
+                kept = await self.ex.cancel(resting)
             except Exception as e:  # noqa: BLE001
                 self.j.log("error", where="close_cancel", market=m["slug"], error=repr(e)[:300])
+                break
+            resting = list(kept or {})
+            if resting:
+                self.j.log("cancel_failed", market=m["slug"], orders=kept, attempt=attempt)
         for t in w.tasks:
             if t is not asyncio.current_task():
                 t.cancel()
@@ -751,21 +797,32 @@ def summarize(journal_path):
     traded = [s for s in settles if s["spent"] > 0]
     spent = sum(s["spent"] for s in traded)
     pnl = sum(s["pnl"] for s in traded)
-    pairs = []
+    pairs, locked = [], 0.0
     for s in traded:
         sh, co = s["shares"], s["cost"]
         if sh["Up"] > 0 and sh["Down"] > 0:
-            pairs.append(co["Up"] / sh["Up"] + co["Down"] / sh["Down"])
+            pc = co["Up"] / sh["Up"] + co["Down"] / sh["Down"]
+            pairs.append(pc)
+            locked += min(sh["Up"], sh["Down"]) * (1 - pc)
     pairs.sort()
+    first = defaultdict(dict)                      # market -> outcome -> first fill time
+    for f in fills:
+        first[f["market"]].setdefault(f["outcome"], f["ts"])
+    waits = sorted(max(first[m].values()) - min(first[m].values())
+                   for m in {s["market"] for s in traded} if len(first[m]) == 2)
     print("mode %s  wallet %s  since %s UTC" % (mode, wallet, datetime.fromtimestamp(
         start or 0, timezone.utc).strftime("%Y-%m-%d %H:%M")))
     print("windows settled %d, traded %d, fills %d" % (len(settles), len(traded), len(fills)))
     if spent:
         print("spent $%.2f  pnl $%+.2f  edge %+.2f%% (settlement, before fees/rebates)"
               % (spent, pnl, 100 * pnl / spent))
+        # The reference wallet's whole profit is in locked pairs; its one-sided leftovers lose.
+        print("  of which locked pairs $%+.2f, one-sided leftovers $%+.2f" % (locked, pnl - locked))
     if pairs:
-        print("pair cost median %.3f (reference wallet ~0.963), both-sided windows %d/%d"
+        print("pair cost median %.3f (reference wallet 0.941), paired windows %d/%d (reference 98%%)"
               % (pairs[len(pairs) // 2], len(pairs), len(traded)))
+    if waits:
+        print("first leg -> hedge fill median %.0fs (reference 21s, n=%d)" % (waits[len(waits) // 2], len(waits)))
     if mode == "live":
         for name, xs in latency.items():
             if xs:

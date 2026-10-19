@@ -68,8 +68,10 @@ class QuoteTests(unittest.TestCase):
 
     def test_price_band(self):
         out = quotes({'Up': (0.01, 0.02), 'Down': (0.97, 0.99)}, params=q.Params(pair_cap=1.0))
-        self.assertEqual(out['Up'], (None, 'price_band'))
+        self.assertEqual(out['Up'], (0.01, 'ok'))          # the cheap leg of a 0.97 + 0.01 pair is allowed
         self.assertEqual(out['Down'], (None, 'price_band'))
+        out = quotes({'Up': (0.01, 0.02), 'Down': (0.97, 0.99)}, params=q.Params(pair_cap=1.0, min_price=0.03))
+        self.assertEqual(out['Up'], (None, 'price_band'))
 
     def test_window_edges(self):
         tops = {'Up': (0.48, 0.50), 'Down': (0.48, 0.50)}

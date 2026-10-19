@@ -9,9 +9,14 @@ It is separate from the momentum bot in the repository root and shares no code w
 ## What the reference wallet does (Oct 2026 sample, 1,095 windows)
 
 - Buys **both** Up and Down in ~98% of windows, never sells, redeems ~65s after close.
-- ~70% of fills are resting bids (maker); pair cost (avg Up + avg Down) median ~0.963.
+- ~70% of fills are resting bids (maker); pair cost (avg Up + avg Down) median 0.941 weighted
+  by pairs; 11% of its shares are bought at 0.01–0.02 (the cheap leg of 0.95 + 0.02 pairs).
 - Per-fill settlement edge **+2.45%** gross, **-0.62%** taker fees, **+0.28%** maker rebate.
 - Roughly half of its profit is trading edge and half is maker/taker rebates.
+- Splitting each window into locked pairs and the one-sided leftover (5m markets, 823 windows):
+  pairs **+$40k** (90% CI 35–45k), leftovers **−$26k** (CI −30k to −22k). The whole edge is in
+  completing pairs; the hedge leg fills a median 21s after the first leg. Price buckets such as
+  bids below 0.10 or between 0.50 and 0.70 show no significant edge on their own.
 
 ## What this bot does
 
@@ -64,8 +69,10 @@ REST only reconciles fills and open orders every 5 seconds and at settlement.
 Most pick-offs follow a BTC move on other venues, and the Polymarket book reflects it
 only later. So the bot also streams BTC trades from Binance: when BTC's move over the last
 2 seconds implies a fair-price move of `MR_PULL_TICKS` or more (binary-option sensitivity,
-with moneyness read from the Up mid), it cancels every bid in the window and stays out for
-`MR_PULL_COOLDOWN_SECS`.
+with moneyness read from the Up mid), it cancels every bid that would add one-sided exposure
+and keeps those bids off for `MR_PULL_COOLDOWN_SECS`. The hedge bid (the lagging side,
+priced to complete pairs at a locked cost) is left alone: a BTC move cannot hurt a locked
+pair, and the reversal that fires the pull is exactly when the hedge fills.
 
 Measured over 14 minutes (440 two-tick moves of the Up mid), with the default settings:
 

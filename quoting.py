@@ -32,7 +32,7 @@ class Params:
     max_market_usd: float = 12.0     # total spend cap per window
     pair_cap: float = 0.97           # max avg(Up) + avg(Down) we accept
     max_imbalance: float = 15.0      # shares one side may lead before it stops bidding
-    min_price: float = 0.03
+    min_price: float = 0.01          # 0.95 + 0.02 pairs are ~11% of the reference wallet's shares
     max_price: float = 0.97
     start_delay_secs: int = 3        # skip the opening seconds of a window
     stop_secs: int = 5               # cancel everything this long before close

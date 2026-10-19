@@ -32,16 +32,23 @@ class FakeLive:
         self.calls, self.redeemed = [], []
         self.seq = 0
         self.wallet = "0xme"
+        self.before_place = None               # awaited during the place round trip
+        self.not_canceled = {}                 # ids the CLOB would report as still open
 
     def market_orders(self, m):
         return {oid: o for oid, o in self.orders.items() if o["market"] == m["condition_id"]}
 
     async def cancel(self, ids):
         self.calls.append(("cancel", sorted(ids)))
+        kept = {oid: self.not_canceled[oid] for oid in ids if oid in self.not_canceled}
         for oid in ids:
-            self.orders.pop(oid, None)
+            if oid not in kept:
+                self.orders.pop(oid, None)
+        return kept
 
     async def place(self, m, outcome, price, size):
+        if self.before_place:
+            await self.before_place()
         self.seq += 1
         oid = "o%d" % self.seq
         self.calls.append(("place", outcome, price))
@@ -168,6 +175,51 @@ class SpotPullTests(EngineTests):
             self.assertEqual(len(self.ex.orders), 2)
         run(go())
 
+    def test_btc_pull_leaves_the_hedge_bid_alone(self):
+        async def go():
+            w = self.window(up=(0.49, 0.51), down=(0.49, 0.51))
+            self.bot.windows[w.m["slug"]] = w
+            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 5.0, 0.48, "maker")   # Up leads: Down is the hedge
+            await self.bot.reconcile(w, time.time())
+            self.assertEqual(sorted(self.ex.calls), [("place", "Down", 0.49), ("place", "Up", 0.48)])
+            self.ex.calls.clear()
+            self.bot.spot.push(80030.0, time.time())
+            self.bot.on_spot(80030.0)
+            await asyncio.sleep(0.01)
+            self.assertEqual(self.ex.calls, [("cancel", ["o1"])])          # only the Up bid is exposed
+            await self.bot.reconcile(w, time.time())                        # cooling down: hedge stays
+            self.assertEqual({o["outcome"] for o in self.ex.orders.values()}, {"Down"})
+            self.assertEqual(w.last_targets["Down"][1], "ok")
+            self.assertEqual(w.last_targets["Up"][1], "pulled")
+        run(go())
+
+    def test_bids_placed_while_a_pull_is_in_flight_are_taken_down(self):
+        async def go():
+            w = self.window(up=(0.49, 0.51), down=(0.49, 0.51))
+            self.bot.windows[w.m["slug"]] = w
+
+            async def pull_fires():
+                w.pulled_until = time.time() + 2    # the pull saw no orders yet, so it cancelled nothing
+            self.ex.before_place = pull_fires
+            await self.bot.reconcile(w, time.time())
+            self.assertEqual(self.ex.orders, {})
+            self.assertEqual(self.ex.calls[-1], ("cancel", ["o1", "o2"]))
+            self.assertTrue(self.events("pull")[0]["late"])
+        run(go())
+
+    def test_cancel_the_clob_refused_blocks_replacement_and_forces_a_sync(self):
+        async def go():
+            w = await self.placed_window()
+            w.last_sync = time.time()
+            self.ex.not_canceled = {"o1": "still open", "o2": "still open"}
+            w.books["Up"].level("BUY", 0.49, 0)         # Up bid drops: both targets move
+            w.books["Up"].level("BUY", 0.40, 100)
+            await self.bot.reconcile(w, time.time())
+            self.assertEqual(self.ex.calls, [("cancel", ["o1", "o2"])])   # no replacements next to live bids
+            self.assertEqual(set(self.ex.orders), {"o1", "o2"})
+            self.assertEqual(w.last_sync, 0.0)
+        run(go())
+
     def test_stale_spot_cancels_and_blocks_quoting(self):
         async def go():
             w = await self.placed_window()
@@ -212,6 +264,16 @@ class LiveBackendTests(unittest.TestCase):
         self.assertIsNone(oid)
         self.assertIn("post-only", err)
         self.assertEqual(lv.orders, {})
+
+    def test_cancel_keeps_tracking_orders_the_clob_did_not_cancel(self):
+        lv = self.live()
+        for oid in ("o1", "o2"):
+            lv.orders[oid] = {"market": "0xc", "outcome": "Up", "price": 0.4, "size": 5, "ts": 9.0}
+        lv.c = NS(cancel_orders=mock.AsyncMock(return_value=NS(canceled=("o1",), not_canceled={"o2": "open"})))
+        kept = run(lv.cancel(["o1", "o2"]))
+        self.assertEqual(kept, {"o2": "open"})
+        self.assertEqual(set(lv.orders), {"o2"})
+        self.assertEqual(lv.orders["o2"]["ts"], 0.0)   # the next sync decides whether it is really open
 
     def test_user_stream_fill_then_failed_trade_is_dropped(self):
         lv = self.live()
