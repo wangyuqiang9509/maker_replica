@@ -76,6 +76,25 @@ class QuoteTests(unittest.TestCase):
         inv.add('Down', 'BUY', 5, 0.20)
         self.assertEqual(quotes({'Up': (0.78, 0.80), 'Down': (0.20, 0.22)}, inv)['Down'][1], 'ok')
 
+    def test_imbalance_is_measured_at_cost_not_at_the_falling_price(self):
+        # Live 09:20: Down filled 7 @ 0.41, then kept falling. 7 * 0.32 = 2.24 would have allowed a
+        # second naked order (it did: 8 @ 0.32, never hedged); 7 * 0.41 = 2.87 at cost blocks it.
+        inv = q.Inventory()
+        inv.add('Down', 'BUY', 7, 0.41)
+        self.assertEqual(quotes({'Up': (0.66, 0.68), 'Down': (0.32, 0.34)}, inv)['Down'], (None, 'imbalance'))
+
+    def test_leading_order_leaves_room_for_its_hedge(self):
+        # Live 08:55: 23 Down at 0.11 ($2.5) needed 23 Up at 0.85 ($19.6); the $12 budget hedged 5.
+        sizes = {}
+        out = quotes({'Up': (0.86, 0.88), 'Down': (0.11, 0.13)}, sizes=sizes)
+        self.assertEqual(out['Down'], (0.11, 'ok'))           # 0.97 - 0.86
+        self.assertEqual(sizes['Down'], 12)                    # floor(12 / 0.97), not ceil(2.5 / 0.11) = 23
+        inv = q.Inventory()
+        inv.add('Down', 'BUY', 5, 0.20)                        # 5 ahead ($1 at cost): their hedge (5 * 0.77) is reserved too
+        out = quotes({'Up': (0.78, 0.80), 'Down': (0.20, 0.22)}, inv, sizes=sizes)
+        self.assertEqual(out['Down'], (0.19, 'ok'))           # 0.97 - 0.78
+        self.assertEqual(sizes['Down'], 7)                     # floor((12 - 1 - 3.85) / 0.97), not ceil(2.5 / 0.19) = 14
+
     def test_quote_size_rests_dollars_and_hedges_share_for_share(self):
         self.assertEqual(q.quote_size(0.20, 0, P), 13)        # ceil(2.5 / 0.20): the cheap side rests more
         self.assertEqual(q.quote_size(0.80, 0, P), 5)         # ceil(3.1) = 4 -> minimum 5
@@ -129,10 +148,11 @@ class TakerHedgeTests(unittest.TestCase):
 
     def test_budget_counts_other_sides_resting_bid(self):
         inv = q.Inventory()
-        inv.add('Up', 'BUY', 10, 0.45)
-        inv.add('Down', 'BUY', 10, 0.45)  # spent 9
-        out = quotes({'Up': (0.40, 0.45), 'Down': (0.50, 0.55)}, inv, committed={'Up': 2.0})
-        # Down: 9 spent + 2 resting on Up + 0.51 * 5 > 12. Up ignores its own resting bid: 9 + 0.41 * 5 <= 12.
+        inv.add('Up', 'BUY', 5, 0.45)
+        inv.add('Down', 'BUY', 5, 0.45)  # spent 4.5
+        out = quotes({'Up': (0.40, 0.45), 'Down': (0.50, 0.55)}, inv, committed={'Up': 4.0})
+        # Down: 4.5 spent + 4 resting on Up leaves 3.5, not enough for 5 shares plus their hedge (5 * 0.97).
+        # Up ignores its own resting bid: 7.5 left >= 5 * 0.97.
         self.assertEqual(out['Down'], (None, 'budget'))
         self.assertEqual(out['Up'], (0.41, 'ok'))
 

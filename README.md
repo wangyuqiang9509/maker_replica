@@ -26,8 +26,10 @@ It is separate from the momentum bot in the repository root and shares no code w
 - Caps every bid at `MR_PAIR_CAP - other side's price`; once one side leads, the lagging
   side is priced against the leading side's average cost and sized to complete the pairs,
   so each completed pair costs at most `MR_PAIR_CAP`.
-- Stops bidding the leading side once it is `MR_MAX_IMBALANCE_USD` ahead and stops a window
-  at `MR_MAX_MARKET_USD`.
+- Stops bidding the leading side once it is `MR_MAX_IMBALANCE_USD` ahead at cost (measured
+  at the current price, a falling side kept qualifying for more), and stops a window at
+  `MR_MAX_MARKET_USD`. A leading bid is never larger than what the remaining budget can
+  still hedge (`MR_PAIR_CAP` per share), so the hedge leg is not cut short by the budget.
 - Completes a naked side at the ask (FAK taker order) whenever
   `avg(leading) + ask × (1 + MR_TAKER_FEE_PCT/100) <= MR_PAIR_CAP`. Never sells.
   See `PROPOSAL.md` for the live numbers behind these two rules.

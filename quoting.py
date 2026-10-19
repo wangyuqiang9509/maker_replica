@@ -11,7 +11,8 @@ The rule set here: rest one post-only bid per outcome, priced at the best bid
 shares, the reference for the lagging side is the leading side's average cost,
 so completing a pair always locks a pair cost <= pair_cap. Bids are sized in
 dollars (`order_usd`), so the cheap outcome rests more shares and leftovers are
-cheap; the leading side stops bidding once it is `max_imbalance_usd` ahead.
+cheap; the leading side stops bidding once it is `max_imbalance_usd` ahead at cost, and a
+leading order is never larger than what the budget can still hedge.
 A naked position is completed at the ask (taker) whenever the pair still fits
 under `pair_cap` after the taker fee.
 
@@ -151,7 +152,9 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None, 
         ref = oa if lead < -EPS else max(ob, oa or 0.0)
         px = floor_tick(min(px, params.pair_cap - ref) + EPS, tick)
 
-        if lead > EPS and lead * px >= params.max_imbalance_usd - EPS:
+        # Imbalance is measured at cost, not at the current price: a side that keeps falling makes
+        # lead * px shrink and let a second naked order through live (7 @ 0.41, then 8 @ 0.32, no hedge).
+        if lead > EPS and lead * inv.avg(o) >= params.max_imbalance_usd - EPS:
             out[o] = (None, "imbalance")
             continue
         if px < params.min_price - EPS or px > params.max_price + EPS:
@@ -159,8 +162,14 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None, 
             continue
         size = quote_size(px, lead, params)
         room = params.max_market_usd - inv.spent - (committed or {}).get(other(o), 0.0)
-        if px * size > room + EPS and lead < -EPS:
-            size = float(math.floor((room + EPS) / px))  # hedge what the budget still allows
+        if lead < -EPS:
+            if px * size > room + EPS:
+                size = float(math.floor((room + EPS) / px))  # hedge what the budget still allows
+        else:
+            # A leading order and the hedge that completes it cost at most pair_cap per share, and shares
+            # already ahead still need theirs: 23 Down at 0.11 ($2.5) needed $19 of Up live and got $4.6.
+            reserve = lead * (params.pair_cap - inv.avg(o)) if lead > EPS else 0.0
+            size = min(size, float(math.floor((room - reserve + EPS) / params.pair_cap)))
         if size < params.order_shares - EPS or px * size > room + EPS:
             out[o] = (None, "budget")
         else:

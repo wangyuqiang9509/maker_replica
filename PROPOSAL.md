@@ -91,6 +91,36 @@ Net per pair = locked − (loss per leftover share × leftover ratio). With the 
 needs its 9.4 c pair margin and its leftover profile together. So the honest expectation
 is break-even, and the decision after a day is on the leftover numbers, not on PnL.
 
+## First 14 live windows (2026-10-19 08:45–09:55 UTC)
+
+From the wallet's on-chain fills, against the targets above:
+
+| metric | before | after 14 windows | target |
+|---|---|---|---|
+| net | −$1.07 / window | −$0.30 / window (−$4.25 on $146) | > 0 |
+| paired windows | 56% | 93% (13/14) | ≥ 85% |
+| leftover / paired shares | 0.9 | 0.47 | ≤ 0.5 |
+| leftover average cost | ~0.5 | 0.28 | ≤ 0.35 |
+| loss per leftover share | −31 c | −19 c | ≤ −15 c |
+| locked profit per pair | +9 c | +6.3 c | ≥ +6 c |
+| leftover windows won | 13% | 10% (1/10) | reference 24% |
+
+The leftover loss (−$12.5) came from two mechanical causes, both fixed in the next
+commit, rather than from the leftover win rate:
+
+1. **The budget cut the hedge leg short** (4 windows, about −$5). Dollar sizing rests
+   23 shares at 0.11 for $2.5; hedging them at 0.85 needs $19.6 and the $12 window
+   budget had $4.6 left, so 18 shares stayed naked. Fix: a leading or level bid is sized
+   to `min(order_usd / price, (room − hedge reserve) / pair_cap)`, so the order plus
+   the hedge that completes it always fits.
+2. **Imbalance measured at the current price let a second naked order through**
+   (3 windows, about −$4). Down filled 7 @ 0.41, fell to 0.32, and 7 × 0.32 = 2.24 < 2.5
+   allowed 8 more @ 0.32; Up was too dear to hedge and 15 shares lost. Fix: imbalance is
+   `lead × average cost` (7 × 0.41 = 2.87 blocks the second order).
+
+One fill was not the bot's: a sell of 17 Up @ 0.21 at 09:02:48 turned that window's pair
+cost into 1.14. The bot never sells; keep other tools off the account while it runs.
+
 ## What this does not fix
 
 The 13% leftover win rate (against 24%) is adverse selection: our bids get hit later than
