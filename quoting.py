@@ -31,7 +31,7 @@ class Params:
     order_shares: float = 5.0        # per resting order; Polymarket minimum is 5
     max_market_usd: float = 12.0     # total spend cap per window
     pair_cap: float = 0.97           # max avg(Up) + avg(Down) we accept
-    max_imbalance: float = 15.0      # shares one side may lead before it stops bidding
+    max_imbalance: float = 5.0       # shares one side may lead before it stops bidding (one unhedged fill)
     min_price: float = 0.01          # 0.95 + 0.02 pairs are ~11% of the reference wallet's shares
     max_price: float = 0.97
     start_delay_secs: int = 3        # skip the opening seconds of a window
@@ -143,8 +143,11 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None):
 
         px = bb + tick if params.improve and ba - bb > tick + EPS else bb
         px = min(px, ba - tick)  # post-only: never touch the ask
-        # Lagging side completes pairs against our own average; otherwise price against the other bid.
-        ref = inv.avg(other(o)) if lead < -EPS else ob
+        # Lagging side completes pairs against our own average. Leading or level, price against the
+        # other bid, but never above what our own shares of the other side allow: adding to this side
+        # raises its average, and 0.33 Down + 0.64 Up followed by Down at 0.46 made a 1.03 pair live.
+        oa = inv.avg(other(o))
+        ref = oa if lead < -EPS else max(ob, oa or 0.0)
         px = floor_tick(min(px, params.pair_cap - ref) + EPS, tick)
 
         if px < params.min_price - EPS or px > params.max_price + EPS:

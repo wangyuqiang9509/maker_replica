@@ -179,7 +179,7 @@ class SpotPullTests(EngineTests):
         async def go():
             w = self.window(up=(0.49, 0.51), down=(0.49, 0.51))
             self.bot.windows[w.m["slug"]] = w
-            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 5.0, 0.48, "maker")   # Up leads: Down is the hedge
+            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 3.0, 0.48, "maker")   # Up leads: Down is the hedge
             await self.bot.reconcile(w, time.time())
             self.assertEqual(sorted(self.ex.calls), [("place", "Down", 0.49), ("place", "Up", 0.48)])
             self.ex.calls.clear()

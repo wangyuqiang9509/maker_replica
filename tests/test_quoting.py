@@ -50,6 +50,16 @@ class QuoteTests(unittest.TestCase):
         out = quotes({'Up': (0.30, 0.32), 'Down': (0.66, 0.70)}, inv)
         self.assertEqual(out['Down'], (0.37, 'ok'))
 
+    def test_level_inventory_still_caps_against_own_other_side_average(self):
+        # Live 05:40 window: Down 5 @ 0.33, Up 5 @ 0.64, then Down filled at 0.46 against the Up
+        # *market* bid and the realised pair became 1.03. Our own Up average must cap the Down bid.
+        inv = q.Inventory()
+        inv.add('Down', 'BUY', 5, 0.33)
+        inv.add('Up', 'BUY', 5, 0.64)
+        out = quotes({'Up': (0.50, 0.52), 'Down': (0.46, 0.48)}, inv)
+        self.assertEqual(out['Down'], (0.33, 'ok'))      # 0.97 - 0.64, not 0.97 - 0.50
+        self.assertEqual(out['Up'], (0.51, 'ok'))        # 0.97 - 0.33 = 0.64 is not binding
+
     def test_leading_side_stops_at_imbalance(self):
         inv = q.Inventory()
         inv.add('Up', 'BUY', 15, 0.40)
