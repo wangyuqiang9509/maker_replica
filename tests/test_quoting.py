@@ -82,6 +82,12 @@ class QuoteTests(unittest.TestCase):
         self.assertEqual(q.quote_size(0.30, -13, P), 13)      # hedge: what completes the pairs
         self.assertEqual(q.quote_size(0.30, -3, P), 5)
 
+    def test_cap_leaving_no_room_is_price_band_not_a_crash(self):
+        inv = q.Inventory()
+        inv.add('Down', 'BUY', 5, 0.97)                        # Up cap = 0.97 - 0.97 = 0 (paper run hit this)
+        out = quotes({'Up': (0.02, 0.03), 'Down': (0.96, 0.97)}, inv, params=q.Params())
+        self.assertEqual(out['Up'], (None, 'price_band'))
+
     def test_hedge_shrinks_to_the_budget_instead_of_vanishing(self):
         inv = q.Inventory()
         inv.add('Down', 'BUY', 13, 0.20)                       # spent 2.6; hedging 13 Up at 0.76 would cost 9.9

@@ -151,15 +151,17 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None, 
         ref = oa if lead < -EPS else max(ob, oa or 0.0)
         px = floor_tick(min(px, params.pair_cap - ref) + EPS, tick)
 
+        if lead > EPS and lead * px >= params.max_imbalance_usd - EPS:
+            out[o] = (None, "imbalance")
+            continue
+        if px < params.min_price - EPS or px > params.max_price + EPS:
+            out[o] = (None, "price_band")  # also px <= 0 when the cap leaves no room
+            continue
         size = quote_size(px, lead, params)
         room = params.max_market_usd - inv.spent - (committed or {}).get(other(o), 0.0)
         if px * size > room + EPS and lead < -EPS:
             size = float(math.floor((room + EPS) / px))  # hedge what the budget still allows
-        if lead > EPS and lead * px >= params.max_imbalance_usd - EPS:
-            out[o] = (None, "imbalance")
-        elif px < params.min_price - EPS or px > params.max_price + EPS:
-            out[o] = (None, "price_band")
-        elif size < params.order_shares - EPS or px * size > room + EPS:
+        if size < params.order_shares - EPS or px * size > room + EPS:
             out[o] = (None, "budget")
         else:
             out[o] = (round(px, 6), "ok")
