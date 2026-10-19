@@ -141,6 +141,25 @@ EOF
     ensure_venv
     cd "$DIR" && "$PY" -m unittest discover -s tests
     ;;
+  verify)
+    # Pre-flight for a host about to go live: unit tests, a short paper run on live books,
+    # then the summary and the network check. Exits non-zero if the paper run logged errors.
+    ensure_venv
+    cd "$DIR"
+    "$PY" -m unittest discover -s tests -q || exit 1
+    vj="$RUNTIME/verify_journal.jsonl"
+    rm -f "$vj"
+    echo "paper run for ${MR_VERIFY_MINUTES:-6} minutes on live books ..."
+    "$PY" bot.py run --minutes "${MR_VERIFY_MINUTES:-6}" --journal "$vj" >"$RUNTIME/verify.log" 2>&1 || { tail -20 "$RUNTIME/verify.log"; exit 1; }
+    "$PY" bot.py summary --journal "$vj"
+    errors="$(grep -c '"event": "error"' "$vj" || true)"
+    places="$(grep -c '"event": "place"' "$vj" || true)"
+    takes="$(grep -c '"event": "take"' "$vj" || true)"
+    echo "paper run: $places places, $takes taker hedges, $errors errors (log: runtime/verify.log)"
+    [[ "$errors" == "0" && "$places" != "0" ]] || { echo "VERIFY FAILED"; exit 1; }
+    "$PY" latency.py
+    echo "VERIFY OK"
+    ;;
   *)
     sed -n '2,10p' "$0"
     exit 1

@@ -20,12 +20,17 @@ It is separate from the momentum bot in the repository root and shares no code w
 
 ## What this bot does
 
-- Rests one post-only bid per outcome, at the best bid or one tick inside the spread.
+- Rests one post-only bid per outcome, at the best bid or one tick inside the spread,
+  sized at `MR_ORDER_USD` per bid (so the cheap outcome rests more shares and whatever is
+  left unpaired is cheap; the reference wallet's leftovers average 0.33).
 - Caps every bid at `MR_PAIR_CAP - other side's price`; once one side leads, the lagging
-  side is priced against the leading side's average cost, so each completed pair costs
-  at most `MR_PAIR_CAP`.
-- Stops bidding the leading side at `MR_MAX_IMBALANCE` shares and stops a window at
-  `MR_MAX_MARKET_USD`. Never sends taker orders.
+  side is priced against the leading side's average cost and sized to complete the pairs,
+  so each completed pair costs at most `MR_PAIR_CAP`.
+- Stops bidding the leading side once it is `MR_MAX_IMBALANCE_USD` ahead and stops a window
+  at `MR_MAX_MARKET_USD`.
+- Completes a naked side at the ask (FAK taker order) whenever
+  `avg(leading) + ask × (1 + MR_TAKER_FEE_PCT/100) <= MR_PAIR_CAP`. Never sells.
+  See `PROPOSAL.md` for the live numbers behind these two rules.
 - Re-prices on every streamed book update (see Latency).
 - Cancels everything `MR_STOP_SECS` before close, holds to settlement, and redeems through
   the gasless relayer.

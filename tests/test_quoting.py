@@ -9,14 +9,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import quoting as q  # noqa: E402
 
-P = q.Params(order_shares=5, max_market_usd=12, pair_cap=0.97, max_imbalance=15,
+P = q.Params(order_usd=2.5, order_shares=5, max_market_usd=12, pair_cap=0.97, max_imbalance_usd=2.5,
              min_price=0.03, max_price=0.97, start_delay_secs=3, stop_secs=5, improve=True)
 MID = dict(secs_left=150, secs_in=150)
 
 
-def quotes(tops, inv=None, params=P, tick=0.01, committed=None, **kw):
+def quotes(tops, inv=None, params=P, tick=0.01, committed=None, sizes=None, **kw):
     t = dict(MID, **kw)
-    return q.compute_quotes(tops, tick, inv or q.Inventory(), params, t['secs_left'], t['secs_in'], committed)
+    return q.compute_quotes(tops, tick, inv or q.Inventory(), params, t['secs_left'], t['secs_in'], committed, sizes)
 
 
 class BookTests(unittest.TestCase):
@@ -62,10 +62,64 @@ class QuoteTests(unittest.TestCase):
 
     def test_leading_side_stops_at_imbalance(self):
         inv = q.Inventory()
-        inv.add('Up', 'BUY', 15, 0.40)
+        inv.add('Up', 'BUY', 10, 0.40)
         out = quotes({'Up': (0.40, 0.42), 'Down': (0.55, 0.57)}, inv)
         self.assertEqual(out['Up'], (None, 'imbalance'))
         self.assertEqual(out['Down'][1], 'ok')
+
+    def test_imbalance_is_measured_in_dollars(self):
+        # One dear fill (5 @ 0.60 = $3) is already past $2.5; 5 cheap shares at 0.20 ($1) are not.
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 5, 0.60)
+        self.assertEqual(quotes({'Up': (0.58, 0.60), 'Down': (0.40, 0.42)}, inv)['Up'], (None, 'imbalance'))
+        inv = q.Inventory()
+        inv.add('Down', 'BUY', 5, 0.20)
+        self.assertEqual(quotes({'Up': (0.78, 0.80), 'Down': (0.20, 0.22)}, inv)['Down'][1], 'ok')
+
+    def test_quote_size_rests_dollars_and_hedges_share_for_share(self):
+        self.assertEqual(q.quote_size(0.20, 0, P), 13)        # ceil(2.5 / 0.20): the cheap side rests more
+        self.assertEqual(q.quote_size(0.80, 0, P), 5)         # ceil(3.1) = 4 -> minimum 5
+        self.assertEqual(q.quote_size(0.30, -13, P), 13)      # hedge: what completes the pairs
+        self.assertEqual(q.quote_size(0.30, -3, P), 5)
+
+    def test_hedge_shrinks_to_the_budget_instead_of_vanishing(self):
+        inv = q.Inventory()
+        inv.add('Down', 'BUY', 13, 0.20)                       # spent 2.6; hedging 13 Up at 0.76 would cost 9.9
+        sizes = {}
+        out = quotes({'Up': (0.76, 0.78), 'Down': (0.20, 0.22)}, inv, sizes=sizes)
+        self.assertEqual(out['Up'], (0.77, 'ok'))
+        self.assertEqual(sizes['Up'], 12)                      # floor((12 - 2.6) / 0.77)
+        take, why = q.taker_hedge({'Up': (0.73, 0.75), 'Down': (0.20, 0.22)}, inv, P)
+        self.assertEqual((take, why), (('Up', 0.75, 12), 'ok'))   # floor(9.4 / (0.75 * 1.02))
+
+    def test_budget_uses_the_dollar_size(self):
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 10, 0.50)
+        inv.add('Down', 'BUY', 10, 0.45)                       # spent 9.5; 13 shares at 0.20 = 2.6 > 2.5 left
+        out = quotes({'Up': (0.76, 0.78), 'Down': (0.20, 0.22)}, inv)
+        self.assertEqual(out['Down'], (None, 'budget'))
+
+
+class TakerHedgeTests(unittest.TestCase):
+    def test_takes_when_pair_fits_after_fee(self):
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 5, 0.64)                          # live 05:40: Up naked, Down ask 0.30
+        take, why = q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.28, 0.30)}, inv, P)
+        self.assertEqual((take, why), (('Down', 0.30, 5), 'ok'))  # 0.64 + 0.30 * 1.02 = 0.946
+
+    def test_fee_can_push_the_pair_over_the_cap(self):
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 5, 0.64)
+        self.assertEqual(q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.31, 0.33)}, inv, P)[1], 'too_dear')
+        p0 = q.Params(taker_fee_pct=0)
+        self.assertEqual(q.taker_hedge({'Up': (0.60, 0.62), 'Down': (0.31, 0.33)}, inv, p0)[1], 'off')
+
+    def test_level_or_unaffordable_does_not_take(self):
+        inv = q.Inventory()
+        self.assertEqual(q.taker_hedge({'Up': (0.5, 0.52), 'Down': (0.46, 0.48)}, inv, P)[1], 'level')
+        inv.add('Down', 'BUY', 13, 0.20)
+        inv.add('Up', 'BUY', 10, 0.70)                         # spent 9.6; 5 Up at 0.74 * 1.02 = 3.77 > 2.4 left
+        self.assertEqual(q.taker_hedge({'Up': (0.72, 0.74), 'Down': (0.20, 0.22)}, inv, P)[1], 'budget')
 
     def test_budget_counts_other_sides_resting_bid(self):
         inv = q.Inventory()

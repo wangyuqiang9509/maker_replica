@@ -46,6 +46,10 @@ class FakeLive:
                 self.orders.pop(oid, None)
         return kept
 
+    async def take(self, m, outcome, max_price, shares, asks=None):
+        self.calls.append(("take", outcome, max_price, shares))
+        return "t%d" % len(self.calls), None
+
     async def place(self, m, outcome, price, size):
         if self.before_place:
             await self.before_place()
@@ -173,6 +177,19 @@ class SpotPullTests(EngineTests):
             self.bot.spot.recent.clear()
             await self.bot.reconcile(w, time.time())
             self.assertEqual(len(self.ex.orders), 2)
+        run(go())
+
+    def test_naked_side_is_completed_at_the_ask_once(self):
+        async def go():
+            w = self.window(up=(0.60, 0.62), down=(0.28, 0.30))
+            self.bot.windows[w.m["slug"]] = w
+            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 5.0, 0.64, "maker")   # 0.64 + 0.30 * 1.02 <= 0.97
+            await self.bot.reconcile(w, time.time())
+            self.assertEqual(self.ex.calls[0], ("take", "Down", 0.30, 5))
+            self.assertEqual(self.events("take")[0]["pair"], 0.94)
+            self.ex.calls.clear()
+            await self.bot.reconcile(w, time.time())                        # waiting for the fill to stream in
+            self.assertNotIn("take", [c[0] for c in self.ex.calls])
         run(go())
 
     def test_btc_pull_leaves_the_hedge_bid_alone(self):

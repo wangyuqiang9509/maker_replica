@@ -58,16 +58,23 @@ def env_float(name, default):
 def load_params():
     d = q.Params()
     return q.Params(
+        order_usd=env_float("MR_ORDER_USD", d.order_usd),
         order_shares=env_float("MR_ORDER_SHARES", d.order_shares),
         max_market_usd=env_float("MR_MAX_MARKET_USD", d.max_market_usd),
         pair_cap=env_float("MR_PAIR_CAP", d.pair_cap),
-        max_imbalance=env_float("MR_MAX_IMBALANCE", d.max_imbalance),
+        max_imbalance_usd=env_float("MR_MAX_IMBALANCE_USD", d.max_imbalance_usd),
         min_price=env_float("MR_MIN_PRICE", d.min_price),
         max_price=env_float("MR_MAX_PRICE", d.max_price),
         start_delay_secs=int(env_float("MR_START_DELAY_SECS", d.start_delay_secs)),
         stop_secs=int(env_float("MR_STOP_SECS", d.stop_secs)),
         improve=os.getenv("MR_IMPROVE", "1") != "0",
+        taker_hedge=os.getenv("MR_TAKER_HEDGE", "1") != "0",
+        taker_fee_pct=env_float("MR_TAKER_FEE_PCT", d.taker_fee_pct),
     )
+
+
+TAKE_RETRY_SECS = SYNC_SECS + 1   # after a taker hedge: one REST sync must pass before another is considered
+TAKE_REJECT_SECS = 30.0           # after a rejected taker hedge (e.g. below the CLOB minimum)
 
 
 class Journal:
@@ -205,6 +212,18 @@ class Paper:
     async def cancel_all(self):
         self.orders.clear()
 
+    async def take(self, m, outcome, max_price, shares, asks=None):
+        """Simulated FAK buy: walk the streamed asks up to max_price; returns (order_id, error)."""
+        self.seq += 1
+        got = 0.0
+        for px in sorted(asks or {}):
+            if px > max_price + q.EPS or got >= shares - q.EPS:
+                break
+            take = min(asks[px], shares - got)
+            self.fills[m["condition_id"]][("paper-take-%d" % self.seq, px)] = (outcome, "BUY", take, px, "taker")
+            got += take
+        return ("paper-take-%d" % self.seq, None) if got > 0 else (None, "no ask within max_price")
+
     def paper_fills(self, m, asks):
         """Fill resting bids the ask traded through; returns the new fills."""
         new = {}
@@ -288,6 +307,18 @@ class Live:
         self.orders.clear()
         await self.c.cancel_all()
 
+    async def take(self, m, outcome, max_price, shares, asks=None):
+        """FAK buy of `shares` at up to max_price; the fill (if any) arrives on the user stream."""
+        try:
+            r = await self.c.place_market_order(token_id=m["tokens"][outcome], side="BUY",
+                                                amount=str(round(shares * max_price + 0.01, 2)),
+                                                max_price=str(max_price), order_type="FAK")
+        except Exception as e:  # noqa: BLE001
+            return None, repr(e)[:300]
+        if not getattr(r, "ok", False):
+            return None, "%s %s" % (getattr(r, "code", None), getattr(r, "message", None))
+        return r.order_id, None
+
     def merge_fills(self, cid, trades):
         """Merge trades into our fills for one market; returns the new fills."""
         fills, failed = q.fills_from_trades(trades, self.wallet, self.api_key)
@@ -367,6 +398,7 @@ class Window:
         self.tasks = []
         self.pulled_until = 0.0
         self.pulling = False
+        self.next_take = 0.0
 
     def mid_up(self):
         bb, ba = self.books["Up"].top() if "Up" in self.books else (None, None)
@@ -619,7 +651,8 @@ class Bot:
         for o, b in w.books.items():
             # Live bids are in the streamed book; remove them so we never quote against ourselves.
             tops[o] = b.top(own[o] if self.ex.live else None) if b.ready else (None, None)
-        targets = q.compute_quotes(tops, w.tick, inv, self.p, m["end"] - now, now - m["start"], committed)
+        sizes = {}
+        targets = q.compute_quotes(tops, w.tick, inv, self.p, m["end"] - now, now - m["start"], committed, sizes)
         lead = inv.shares["Up"] - inv.shares["Down"]
         hedge = "Down" if lead > q.EPS else "Up" if lead < -q.EPS else None
         if now < w.pulled_until or w.pulling:
@@ -637,13 +670,34 @@ class Bot:
             w.last_targets = targets
             self.j.log("quote", market=m["slug"], tops=tops, targets=targets, shares=inv.shares, cost=inv.cost)
 
+        # Naked position and the other side's ask still fits under the pair cap: take it now.
+        if now >= w.next_take and m["end"] - now > self.p.stop_secs and now - m["start"] >= self.p.start_delay_secs:
+            take, why = q.taker_hedge(tops, inv, self.p)
+            if take:
+                outcome, ask, shares = take
+                t0 = time.perf_counter()
+                oid, err = await self.ex.take(m, outcome, ask, shares, w.books[outcome].asks)
+                # Live fills stream in within a second; the retry waits past one REST sync so a
+                # fill that has not streamed yet cannot be hedged twice. Rejections back off longer.
+                w.next_take = now + (TAKE_RETRY_SECS if oid else TAKE_REJECT_SECS)
+                self.j.log("take", market=m["slug"], outcome=outcome, max_price=ask, size=shares,
+                           order_id=oid, error=err, pair=round((inv.avg(q.other(outcome)) or 0) + ask, 4),
+                           ms=round((time.perf_counter() - t0) * 1000))
+                if oid and not self.ex.live:
+                    fills = self.ex.fills[m["condition_id"]]
+                    self.record_fills(m, {k: v for k, v in fills.items() if k[0] == oid})
+                    inv = q.inventory_from(fills)
+                    w.wake.set()
+
         stale, places = [], []
         for outcome, (px, reason) in targets.items():
             mine = [oid for oid, o in resting.items() if o["outcome"] == outcome]
-            keep = [oid for oid in mine if px is not None and abs(resting[oid]["price"] - px) < w.tick / 2]
+            size = sizes.get(outcome, 0)
+            keep = [oid for oid in mine if px is not None and abs(resting[oid]["price"] - px) < w.tick / 2
+                    and resting[oid]["size"] >= size - q.EPS]
             stale += [(oid, outcome, reason) for oid in mine if oid not in keep]
             if px is not None and not keep:
-                places.append((outcome, px))
+                places.append((outcome, px, size))
         if stale:
             # Protective step first: pull stale bids in one request before posting new ones.
             t0 = time.perf_counter()
@@ -658,15 +712,14 @@ class Bot:
             places = []  # a pull started while we were cancelling
         if places:
             t0 = time.perf_counter()
-            results = await asyncio.gather(*(self.ex.place(m, o, px, self.p.order_shares) for o, px in places))
+            results = await asyncio.gather(*(self.ex.place(m, o, px, size) for o, px, size in places))
             ms = round((time.perf_counter() - t0) * 1000)
-            for (outcome, px), (oid, err) in zip(places, results):
+            for (outcome, px, size), (oid, err) in zip(places, results):
                 if oid:
-                    self.j.log("place", market=m["slug"], outcome=outcome, price=px, size=self.p.order_shares,
-                               order_id=oid, ms=ms)
+                    self.j.log("place", market=m["slug"], outcome=outcome, price=px, size=size, order_id=oid, ms=ms)
                 else:
-                    self.j.log("reject", market=m["slug"], outcome=outcome, price=px, error=err, ms=ms)
-            placed = [oid for (o, _), (oid, _) in zip(places, results) if oid and o != hedge]
+                    self.j.log("reject", market=m["slug"], outcome=outcome, price=px, size=size, error=err, ms=ms)
+            placed = [oid for (o, _, _), (oid, _) in zip(places, results) if oid and o != hedge]
             if placed and (time.time() < w.pulled_until or w.pulling):
                 # A pull fired during the round trip and could not see these yet: take them down now.
                 t0 = time.perf_counter()
@@ -781,7 +834,7 @@ def geoblock():
 # ---------- summary ----------
 
 def summarize(journal_path):
-    settles, fills, start, wallet, mode = [], [], None, None, None
+    settles, fills, takes, start, wallet, mode = [], [], [], None, None, None
     latency = {"cancel": [], "place": []}
     for line in open(journal_path, encoding="utf-8"):
         r = json.loads(line)
@@ -792,18 +845,31 @@ def summarize(journal_path):
             settles.append(r)
         elif r["event"] == "fill":
             fills.append(r)
+        elif r["event"] == "take":
+            takes.append(r)
         elif r["event"] in latency and "ms" in r:
             latency[r["event"]].append(r["ms"])
     traded = [s for s in settles if s["spent"] > 0]
     spent = sum(s["spent"] for s in traded)
     pnl = sum(s["pnl"] for s in traded)
-    pairs, locked = [], 0.0
+    pairs, locked, n_pairs = [], 0.0, 0.0
+    naked = {"shares": 0.0, "cost": 0.0, "pnl": 0.0, "windows": 0, "won": 0}
     for s in traded:
         sh, co = s["shares"], s["cost"]
         if sh["Up"] > 0 and sh["Down"] > 0:
             pc = co["Up"] / sh["Up"] + co["Down"] / sh["Down"]
             pairs.append(pc)
             locked += min(sh["Up"], sh["Down"]) * (1 - pc)
+            n_pairs += min(sh["Up"], sh["Down"])
+        lead = max(sh, key=sh.get)
+        nk = sh[lead] - min(sh.values())
+        if nk > 0:
+            cost = nk * co[lead] / sh[lead]
+            naked["shares"] += nk
+            naked["cost"] += cost
+            naked["pnl"] += (nk if lead == s["winner"] else 0.0) - cost
+            naked["windows"] += 1
+            naked["won"] += lead == s["winner"]
     pairs.sort()
     first = defaultdict(dict)                      # market -> outcome -> first fill time
     for f in fills:
@@ -821,8 +887,16 @@ def summarize(journal_path):
     if pairs:
         print("pair cost median %.3f (reference wallet 0.941), paired windows %d/%d (reference 98%%)"
               % (pairs[len(pairs) // 2], len(pairs), len(traded)))
+        print("locked %+.1fc per pair over %.0f pairs (reference +9.4c)" % (100 * locked / n_pairs, n_pairs))
+    if naked["shares"]:
+        print("leftover: %.0f shares at avg %.3f, %+.1fc/share, won %d/%d windows, leftover/pairs %.2f"
+              % (naked["shares"], naked["cost"] / naked["shares"], 100 * naked["pnl"] / naked["shares"],
+                 naked["won"], naked["windows"], naked["shares"] / n_pairs if n_pairs else float("inf")))
+        print("  (reference: avg 0.33, -14.6c/share, won 24%, ratio 0.49)")
     if waits:
         print("first leg -> hedge fill median %.0fs (reference 21s, n=%d)" % (waits[len(waits) // 2], len(waits)))
+    if takes:
+        print("taker hedges %d sent, %d accepted" % (len(takes), sum(1 for t in takes if t.get("order_id"))))
     if mode == "live":
         for name, xs in latency.items():
             if xs:

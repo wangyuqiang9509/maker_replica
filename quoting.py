@@ -9,9 +9,11 @@ The rule set here: rest one post-only bid per outcome, priced at the best bid
 (or one tick better when the spread allows) but never above
 `pair_cap - reference price of the other outcome`. When one side is ahead in
 shares, the reference for the lagging side is the leading side's average cost,
-so completing a pair always locks a pair cost <= pair_cap. The leading side
-stops bidding once it is `max_imbalance` shares ahead. No taker orders: at a
-small Taker Rebate tier the ~2% taker fee eats the edge.
+so completing a pair always locks a pair cost <= pair_cap. Bids are sized in
+dollars (`order_usd`), so the cheap outcome rests more shares and leftovers are
+cheap; the leading side stops bidding once it is `max_imbalance_usd` ahead.
+A naked position is completed at the ask (taker) whenever the pair still fits
+under `pair_cap` after the taker fee.
 
 Everything here is side-effect free so it can be unit tested and replayed.
 """
@@ -28,15 +30,18 @@ _N = NormalDist()
 
 @dataclass(frozen=True)
 class Params:
-    order_shares: float = 5.0        # per resting order; Polymarket minimum is 5
+    order_usd: float = 2.5           # per resting order, so the cheap side rests more shares than the dear side
+    order_shares: float = 5.0        # minimum shares per order (Polymarket minimum is 5)
     max_market_usd: float = 12.0     # total spend cap per window
     pair_cap: float = 0.97           # max avg(Up) + avg(Down) we accept
-    max_imbalance: float = 5.0       # shares one side may lead before it stops bidding (one unhedged fill)
+    max_imbalance_usd: float = 2.5   # value one side may be ahead by before it stops bidding (one unhedged order)
     min_price: float = 0.01          # 0.95 + 0.02 pairs are ~11% of the reference wallet's shares
     max_price: float = 0.97
     start_delay_secs: int = 3        # skip the opening seconds of a window
     stop_secs: int = 5               # cancel everything this long before close
     improve: bool = True             # step one tick inside the spread when possible
+    taker_hedge: bool = True         # complete a naked position at the ask when the pair still fits the cap
+    taker_fee_pct: float = 2.0       # taker fee as % of taker notional; 0 disables the taker hedge
 
 
 @dataclass
@@ -114,12 +119,12 @@ def other(outcome):
     return "Down" if outcome == "Up" else "Up"
 
 
-def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None):
+def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None, sizes=None):
     """Target bid per outcome.
 
     tops: {outcome: (best_bid, best_ask)}; committed: {outcome: USD resting in our open bid}.
     A quote replaces its own outcome's bid, so only the other outcome's resting USD counts.
-    Returns {outcome: (price | None, reason)}.
+    Returns {outcome: (price | None, reason)}; if `sizes` is a dict it receives {outcome: shares}.
     """
     if secs_left <= params.stop_secs:
         return {o: (None, "closing") for o in OUTCOMES}
@@ -137,10 +142,6 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None):
             out[o] = (None, "crossed")  # transient while a match is still being streamed
             continue
         lead = inv.shares[o] - inv.shares[other(o)]
-        if lead >= params.max_imbalance - EPS:
-            out[o] = (None, "imbalance")
-            continue
-
         px = bb + tick if params.improve and ba - bb > tick + EPS else bb
         px = min(px, ba - tick)  # post-only: never touch the ask
         # Lagging side completes pairs against our own average. Leading or level, price against the
@@ -150,13 +151,60 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None):
         ref = oa if lead < -EPS else max(ob, oa or 0.0)
         px = floor_tick(min(px, params.pair_cap - ref) + EPS, tick)
 
-        if px < params.min_price - EPS or px > params.max_price + EPS:
+        size = quote_size(px, lead, params)
+        room = params.max_market_usd - inv.spent - (committed or {}).get(other(o), 0.0)
+        if px * size > room + EPS and lead < -EPS:
+            size = float(math.floor((room + EPS) / px))  # hedge what the budget still allows
+        if lead > EPS and lead * px >= params.max_imbalance_usd - EPS:
+            out[o] = (None, "imbalance")
+        elif px < params.min_price - EPS or px > params.max_price + EPS:
             out[o] = (None, "price_band")
-        elif inv.spent + (committed or {}).get(other(o), 0.0) + px * params.order_shares > params.max_market_usd + EPS:
+        elif size < params.order_shares - EPS or px * size > room + EPS:
             out[o] = (None, "budget")
         else:
             out[o] = (round(px, 6), "ok")
+            if sizes is not None:
+                sizes[o] = size
     return out
+
+
+def quote_size(px, lead, params):
+    """Shares for a resting bid at px. lead = this side's shares minus the other side's.
+
+    The hedge (lagging) side rests what completes the pairs; any other bid rests a fixed dollar
+    amount, so the cheap outcome rests more shares and the leftovers we end up holding are cheap.
+    """
+    if lead < -EPS:
+        return max(params.order_shares, float(math.ceil(-lead - EPS)))
+    return max(params.order_shares, float(math.ceil(params.order_usd / px - EPS)))
+
+
+def taker_hedge(tops, inv, params):
+    """(outcome, max_price, shares) to buy at the ask now, or (None, reason).
+
+    Only while one side is naked and the pair would still cost <= pair_cap after the taker fee.
+    The locked margin is thinner than a resting hedge's, but it is certain; 44% of live windows
+    ended with no hedge at all and those carried the whole loss.
+    """
+    if not params.taker_hedge or params.taker_fee_pct <= 0:
+        return None, "off"
+    lead = inv.shares["Up"] - inv.shares["Down"]
+    if abs(lead) <= EPS:
+        return None, "level"
+    lagging, leading = ("Down", "Up") if lead > 0 else ("Up", "Down")
+    _, ask = tops.get(lagging, (None, None))
+    if ask is None:
+        return None, "no_book"
+    all_in = ask * (1 + params.taker_fee_pct / 100)
+    if inv.avg(leading) + all_in > params.pair_cap + EPS:
+        return None, "too_dear"
+    shares = max(params.order_shares, float(math.ceil(abs(lead) - EPS)))
+    room = params.max_market_usd - inv.spent
+    if shares * all_in > room + EPS:
+        shares = float(math.floor((room + EPS) / all_in))  # hedge what the budget still allows
+    if shares < params.order_shares - EPS:
+        return None, "budget"
+    return (lagging, ask, shares), "ok"
 
 
 def fair_move(spot_ref, spot, mid_up, secs_left, vol):
