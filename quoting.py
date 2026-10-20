@@ -12,9 +12,12 @@ shares, the reference for the lagging side is the leading side's average cost,
 so completing a pair always locks a pair cost <= pair_cap. Bids are sized in
 dollars (`order_usd`), so the cheap outcome rests more shares and leftovers are
 cheap; the leading side stops bidding once it is `max_imbalance_usd` ahead at cost, and a
-leading order is never larger than what the budget can still hedge.
+leading order is never larger than what the budget can still hedge. After the first fill,
+bids that add one-sided exposure only get the budget that `pace_secs` has released, so the
+window's second pair is bought later, where the reference wallet buys its cheap shares.
 A naked position is completed at the ask (taker) whenever the pair still fits
-under `pair_cap` after the taker fee.
+under `pair_cap` after the taker fee; optionally (`stop_pair`) also at a loss once the
+other side has run away, to cap what a naked window can lose.
 
 Everything here is side-effect free so it can be unit tested and replayed.
 """
@@ -40,9 +43,13 @@ class Params:
     max_price: float = 0.97
     start_delay_secs: int = 3        # skip the opening seconds of a window
     stop_secs: int = 5               # cancel everything this long before close
-    improve: bool = True             # step one tick inside the spread when possible
+    improve: bool = False            # True: step one tick inside the spread; alone at the front, every sweep hits us first
+    pace_secs: int = 180             # after the first fill, one-sided bids get max_market_usd * secs_in / pace_secs; 0 = off
     taker_hedge: bool = True         # complete a naked position at the ask when the pair still fits the cap
     taker_fee_rate: float = 0.07     # Polymarket crypto taker fee: rate * p * (1 - p) USDC per share (3.5% of notional at 0.50)
+    stop_pair: float = 0.0           # > 0: also take the hedge at a locked loss up to this pair cost (see taker_hedge); 0 = off
+    stop_after_secs: int = 20        # ... once the position has been naked this long
+    stop_price: float = 0.75         # ... and the other side's ask is at least this (the naked side is losing)
 
 
 @dataclass
@@ -170,6 +177,17 @@ def compute_quotes(tops, tick, inv, params, secs_left, secs_in, committed=None, 
             # already ahead still need theirs: 23 Down at 0.11 ($2.5) needed $19 of Up live and got $4.6.
             reserve = lead * (params.pair_cap - inv.avg(o)) if lead > EPS else 0.0
             size = min(size, float(math.floor((room - reserve + EPS) / params.pair_cap)))
+            # Pacing: live, the whole budget was spent in the first 80s (two pairs at the opening
+            # price), then nothing. The reference wallet buys through the window (29/21/18/18/14% by
+            # minute) and a quarter of its shares below 0.10. The first pair is not paced; after it,
+            # one-sided bids wait for the budget that time has released. The hedge is never paced.
+            if params.pace_secs > 0 and inv.spent > EPS:
+                released = params.max_market_usd * min(1.0, secs_in / params.pace_secs) - inv.spent
+                paced = min(size, float(math.floor((released + EPS) / px)))
+                if paced < params.order_shares - EPS <= size:
+                    out[o] = (None, "pacing")
+                    continue
+                size = paced
         if size < params.order_shares - EPS or px * size > room + EPS:
             out[o] = (None, "budget")
         else:
@@ -199,12 +217,19 @@ def taker_fee(price, params):
     return params.taker_fee_rate * price * (1 - price)
 
 
-def taker_hedge(tops, inv, params):
+def taker_hedge(tops, inv, params, naked_secs=0.0):
     """(outcome, max_price, shares) to buy at the ask now, or (None, reason).
 
     Only while one side is naked and the pair would still cost <= pair_cap after the taker fee.
     The locked margin is thinner than a resting hedge's, but it is certain; 44% of live windows
     ended with no hedge at all and those carried the whole loss.
+
+    Stop rule (off unless stop_pair > 0): once the position has been naked for stop_after_secs
+    and the other side's ask is at least stop_price, the pair may also be completed at a loss,
+    up to stop_pair per pair (0.45 + 0.80 = 1.25 locks -25c/share instead of risking -45c).
+    This bounds the loss of a naked window; it does not improve the expectation (at a fair
+    0.80 the two outcomes have the same mean), and the fee and half a spread make it slightly
+    worse. Reason "stop" marks such a hedge in the journal.
     """
     if not params.taker_hedge:
         return None, "off"
@@ -216,7 +241,11 @@ def taker_hedge(tops, inv, params):
     if ask is None:
         return None, "no_book"
     all_in = ask + taker_fee(ask, params)
-    if inv.avg(leading) + all_in > params.pair_cap + EPS:
+    cap, why = params.pair_cap, "ok"
+    if (params.stop_pair > params.pair_cap + EPS and naked_secs >= params.stop_after_secs - EPS
+            and ask >= params.stop_price - EPS):
+        cap, why = params.stop_pair, "stop"
+    if inv.avg(leading) + all_in > cap + EPS:
         return None, "too_dear"
     shares = max(params.order_shares, float(math.ceil(abs(lead) - EPS)))
     room = params.max_market_usd - inv.spent
@@ -224,7 +253,7 @@ def taker_hedge(tops, inv, params):
         shares = float(math.floor((room + EPS) / all_in))  # hedge what the budget still allows
     if shares < params.order_shares - EPS:
         return None, "budget"
-    return (lagging, ask, shares), "ok"
+    return (lagging, ask, shares), why
 
 
 def fair_move(spot_ref, spot, mid_up, secs_left, vol):

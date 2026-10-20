@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import quoting as q  # noqa: E402
 
 P = q.Params(order_usd=2.5, order_shares=5, max_market_usd=12, pair_cap=0.97, max_imbalance_usd=2.5,
-             min_price=0.03, max_price=0.97, start_delay_secs=3, stop_secs=5, improve=True)
+             min_price=0.03, max_price=0.97, start_delay_secs=3, stop_secs=5, improve=True, pace_secs=180)
 MID = dict(secs_left=150, secs_in=150)
 
 
@@ -39,8 +39,41 @@ class QuoteTests(unittest.TestCase):
         out = quotes({'Up': (0.49, 0.51), 'Down': (0.49, 0.51)})
         self.assertEqual(out['Up'], (0.48, 'ok'))
 
+    def test_default_joins_the_best_bid(self):
+        # Live with improve=True the bot stood alone one tick ahead of the queue and every sweep hit
+        # it first; the default now rests at the best bid, behind whoever was there.
+        out = quotes({'Up': (0.40, 0.45), 'Down': (0.50, 0.55)}, params=q.Params())
+        self.assertEqual(out['Up'], (0.40, 'ok'))
+        self.assertEqual(out['Down'], (0.50, 'ok'))
+        self.assertFalse(q.Params().improve)
+
+    def test_pacing_releases_the_budget_over_the_window(self):
+        # Live, two pairs at the opening price used the $12 by 80s and the window was over for us.
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 6, 0.42)
+        inv.add('Down', 'BUY', 6, 0.52)                       # first pair done, spent 5.64, level
+        tops = {'Up': (0.40, 0.45), 'Down': (0.50, 0.55)}
+        out = quotes(tops, inv, secs_in=60)                   # 12 * 60 / 180 = 4.0 released < 5.64 spent
+        self.assertEqual(out['Up'], (None, 'pacing'))
+        self.assertEqual(out['Down'], (None, 'pacing'))
+        sizes = {}
+        out = quotes(tops, inv, secs_in=150, sizes=sizes)     # 10.0 released: 4.36 to spend
+        self.assertEqual(out['Up'], (0.41, 'ok'))
+        self.assertEqual(out['Down'], (0.51, 'ok'))
+        self.assertEqual(sizes, {'Up': 6, 'Down': 5})         # Up: 7 by dollars, 6 by the hedgeable budget
+        self.assertEqual(quotes(tops, inv, secs_in=60, params=q.Params(improve=True, pace_secs=0))['Up'], (0.41, 'ok'))
+
+    def test_first_pair_and_hedge_are_not_paced(self):
+        tops = {'Up': (0.40, 0.45), 'Down': (0.50, 0.55)}
+        self.assertEqual(quotes(tops, secs_in=10)['Up'], (0.41, 'ok'))      # nothing bought yet
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 6, 0.42)                                        # Up naked: Down is the hedge
+        out = quotes(tops, inv, secs_in=10)
+        self.assertEqual(out['Down'], (0.51, 'ok'))
+        self.assertEqual(out['Up'], (None, 'imbalance'))
+
     def test_one_tick_spread_joins_best_bid(self):
-        out = quotes({'Up': (0.70, 0.71), 'Down': (0.20, 0.30)}, params=q.Params(pair_cap=1.0))
+        out = quotes({'Up': (0.70, 0.71), 'Down': (0.20, 0.30)}, params=q.Params(pair_cap=1.0, improve=True))
         self.assertEqual(out['Up'][0], 0.70)
         self.assertEqual(out['Down'][0], 0.21)
 
@@ -143,6 +176,19 @@ class TakerHedgeTests(unittest.TestCase):
         self.assertAlmostEqual(q.taker_fee(0.30, P), 0.0147)             # 4.9% of 0.30: a flat 2% was too kind
         self.assertAlmostEqual(q.taker_fee(0.30, q.Params(taker_fee_rate=0)), 0.0)
 
+    def test_stop_rule_completes_a_losing_pair_only_after_the_wait(self):
+        inv = q.Inventory()
+        inv.add('Up', 'BUY', 6, 0.40)                          # Up naked, Down ran to 0.80: pair would be 1.21
+        tops = {'Up': (0.18, 0.20), 'Down': (0.78, 0.80)}
+        self.assertEqual(q.taker_hedge(tops, inv, P, naked_secs=60)[1], 'too_dear')          # off by default
+        stop = q.Params(stop_pair=1.25, stop_after_secs=20, stop_price=0.75)
+        self.assertEqual(q.taker_hedge(tops, inv, stop, naked_secs=5)[1], 'too_dear')        # not yet
+        self.assertEqual(q.taker_hedge(tops, inv, stop, naked_secs=25), (('Down', 0.80, 6), 'stop'))
+        self.assertEqual(q.taker_hedge({'Up': (0.28, 0.30), 'Down': (0.68, 0.70)}, inv, stop, naked_secs=25)[1],
+                         'too_dear')                                                         # ask below stop_price
+        inv.add('Up', 'BUY', 6, 0.50)                          # avg 0.45: 0.45 + 0.80 + fee > 1.25
+        self.assertEqual(q.taker_hedge(tops, inv, stop, naked_secs=25)[1], 'too_dear')
+
     def test_level_or_unaffordable_does_not_take(self):
         inv = q.Inventory()
         self.assertEqual(q.taker_hedge({'Up': (0.5, 0.52), 'Down': (0.46, 0.48)}, inv, P)[1], 'level')
@@ -161,7 +207,7 @@ class TakerHedgeTests(unittest.TestCase):
         self.assertEqual(out['Up'], (0.41, 'ok'))
 
     def test_price_band(self):
-        out = quotes({'Up': (0.01, 0.02), 'Down': (0.97, 0.99)}, params=q.Params(pair_cap=1.0))
+        out = quotes({'Up': (0.01, 0.02), 'Down': (0.97, 0.99)}, params=q.Params(pair_cap=1.0, improve=True))
         self.assertEqual(out['Up'], (0.01, 'ok'))          # the cheap leg of a 0.97 + 0.01 pair is allowed
         self.assertEqual(out['Down'], (None, 'price_band'))
         out = quotes({'Up': (0.01, 0.02), 'Down': (0.97, 0.99)}, params=q.Params(pair_cap=1.0, min_price=0.03))

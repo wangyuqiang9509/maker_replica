@@ -20,9 +20,10 @@ It is separate from the momentum bot in the repository root and shares no code w
 
 ## What this bot does
 
-- Rests one post-only bid per outcome, at the best bid or one tick inside the spread,
-  sized at `MR_ORDER_USD` per bid (so the cheap outcome rests more shares and whatever is
-  left unpaired is cheap; the reference wallet's leftovers average 0.33).
+- Rests one post-only bid per outcome at the best bid (`MR_IMPROVE=1` steps one tick inside
+  the spread instead: live that left the bot alone at the front of the queue, first and in
+  full for every sweep), sized at `MR_ORDER_USD` per bid (so the cheap outcome rests more
+  shares and whatever is left unpaired is cheap; the reference wallet's leftovers average 0.33).
 - Caps every bid at `MR_PAIR_CAP - other side's price`; once one side leads, the lagging
   side is priced against the leading side's average cost and sized to complete the pairs,
   so each completed pair costs at most `MR_PAIR_CAP`.
@@ -30,11 +31,19 @@ It is separate from the momentum bot in the repository root and shares no code w
   at the current price, a falling side kept qualifying for more), and stops a window at
   `MR_MAX_MARKET_USD`. A leading bid is never larger than what the remaining budget can
   still hedge (`MR_PAIR_CAP` per share), so the hedge leg is not cut short by the budget.
+- Paces the budget: after the first fill, bids that add one-sided exposure only get
+  `MR_MAX_MARKET_USD × secs_in / MR_PACE_SECS` (the hedge bid is never paced). Live, the
+  whole budget went in the first 80 s at the opening price; the reference wallet buys through
+  the window (29/21/18/18/14% of fills by minute) and a quarter of its shares below 0.10.
 - Completes a naked side at the ask (FAK taker order) whenever
   `avg(leading) + ask + MR_TAKER_FEE_RATE × ask × (1 − ask) <= MR_PAIR_CAP` (Polymarket's
   crypto taker fee curve, 0.07). The resting hedge bid is cancelled first; if the CLOB reports
   it already matched, the taker order is not sent. Never sells.
   See `PROPOSAL.md` for the live numbers behind these two rules.
+- Optional stop (`MR_STOP_PAIR`, off by default): once a side has been naked for
+  `MR_STOP_AFTER_SECS` and the other side's ask is at least `MR_STOP_PRICE`, the pair is
+  completed at a loss up to `MR_STOP_PAIR` (0.45 + 0.80 locks −25c/share instead of risking
+  −45c). It bounds a naked window's loss and does not improve the expectation.
 - Re-prices on every streamed book update (see Latency).
 - Cancels everything `MR_STOP_SECS` before close, holds to settlement, and redeems through
   the gasless relayer.
@@ -108,6 +117,11 @@ is bootstrapped over markets. `NET` already includes fees and rebates.
 | lower bound > 0 | edge reproduced at this size; consider scaling |
 | upper bound < 0 | not reproduced; stop |
 | interval spans 0 | keep running up to 14 days |
+
+`./run.sh summary` prints the settlement PnL before fees, then the taker fees paid and the
+maker rebate due (both on the crypto fee curve `0.07 × p × (1 − p)` per share; the Maker
+Rebates Program credits 20% of the counterparty's fee on maker fills once a day, ~00:45 UTC;
+2026-10-19: 1,461 maker shares, $4.38 credited) and the net after both.
 
 Also compare the `maker share`, the pair cost (`./run.sh summary`), and the 10s markout
 against the reference wallet. A markout well below the reference's -0.65 c/share means

@@ -67,10 +67,17 @@ def load_params():
         max_price=env_float("MR_MAX_PRICE", d.max_price),
         start_delay_secs=int(env_float("MR_START_DELAY_SECS", d.start_delay_secs)),
         stop_secs=int(env_float("MR_STOP_SECS", d.stop_secs)),
-        improve=os.getenv("MR_IMPROVE", "1") != "0",
+        improve=os.getenv("MR_IMPROVE", "0") == "1",
+        pace_secs=int(env_float("MR_PACE_SECS", d.pace_secs)),
         taker_hedge=os.getenv("MR_TAKER_HEDGE", "1") != "0",
         taker_fee_rate=env_float("MR_TAKER_FEE_RATE", d.taker_fee_rate),
+        stop_pair=env_float("MR_STOP_PAIR", d.stop_pair),
+        stop_after_secs=int(env_float("MR_STOP_AFTER_SECS", d.stop_after_secs)),
+        stop_price=env_float("MR_STOP_PRICE", d.stop_price),
     )
+
+
+MAKER_REBATE_SHARE = 0.20   # Maker Rebates Program: 20% of the counterparty's taker fee, paid daily ~00:45 UTC
 
 
 TAKE_RETRY_SECS = SYNC_SECS + 1   # after a taker hedge: one REST sync must pass before another is considered
@@ -399,6 +406,7 @@ class Window:
         self.pulled_until = 0.0
         self.pulling = False
         self.next_take = 0.0
+        self.naked_since = None       # when the inventory last became one-sided (for the stop rule)
 
     def mid_up(self):
         bb, ba = self.books["Up"].top() if "Up" in self.books else (None, None)
@@ -655,6 +663,10 @@ class Bot:
         targets = q.compute_quotes(tops, w.tick, inv, self.p, m["end"] - now, now - m["start"], committed, sizes)
         lead = inv.shares["Up"] - inv.shares["Down"]
         hedge = "Down" if lead > q.EPS else "Up" if lead < -q.EPS else None
+        if hedge is None:
+            w.naked_since = None
+        elif w.naked_since is None:
+            w.naked_since = now
         if now < w.pulled_until or w.pulling:
             block = "pulled"
         elif not self.spot.fresh(self.ss.stale_secs):
@@ -672,7 +684,7 @@ class Bot:
 
         # Naked position and the other side's ask still fits under the pair cap: take it now.
         if now >= w.next_take and m["end"] - now > self.p.stop_secs and now - m["start"] >= self.p.start_delay_secs:
-            take, why = q.taker_hedge(tops, inv, self.p)
+            take, why = q.taker_hedge(tops, inv, self.p, now - w.naked_since if w.naked_since else 0.0)
             if take:
                 outcome, ask, shares = take
                 t0 = time.perf_counter()
@@ -694,7 +706,7 @@ class Bot:
                 w.next_take = now + (TAKE_RETRY_SECS if oid or kept else TAKE_REJECT_SECS)
                 self.j.log("take", market=m["slug"], outcome=outcome, max_price=ask, size=shares,
                            order_id=oid, error=err, pair=round((inv.avg(q.other(outcome)) or 0) + ask, 4),
-                           cancelled=mine, ms=round((time.perf_counter() - t0) * 1000))
+                           rule=why, cancelled=mine, ms=round((time.perf_counter() - t0) * 1000))
                 # No new bid on this side until the fill (or its absence) is known.
                 targets = dict(targets, **{outcome: (None, "taking")})
                 if oid and not self.ex.live:
@@ -910,7 +922,24 @@ def summarize(journal_path):
     if waits:
         print("first leg -> hedge fill median %.0fs (reference 21s, n=%d)" % (waits[len(waits) // 2], len(waits)))
     if takes:
-        print("taker hedges %d sent, %d accepted" % (len(takes), sum(1 for t in takes if t.get("order_id"))))
+        stops = sum(1 for t in takes if t.get("rule") == "stop")
+        print("taker hedges %d sent, %d accepted%s" % (len(takes), sum(1 for t in takes if t.get("order_id")),
+                                                       ", %d stop-loss" % stops if stops else ""))
+    if fills:
+        # Fees and the maker rebate are not in the settlement PnL. Both follow the crypto taker fee
+        # curve rate * p * (1 - p) per share: we pay it on taker fills, and the Maker Rebates Program
+        # pays us 20% of what the counterparty paid on our maker fills (checked 2026-10-19: 1,461
+        # maker shares, $4.38 credited = 20.0% of the curve). It is credited daily, not per window.
+        rate = env_float("MR_TAKER_FEE_RATE", q.Params().taker_fee_rate)
+        fee_of = lambda f: rate * f["price"] * (1 - f["price"]) * f["size"]  # noqa: E731
+        paid = sum(fee_of(f) for f in fills if f.get("role") == "taker")
+        rebate = MAKER_REBATE_SHARE * sum(fee_of(f) for f in fills if f.get("role") == "maker")
+        maker_shares = sum(f["size"] for f in fills if f.get("role") == "maker")
+        print("fees: taker fees paid $%.2f, maker rebate due ~$%.2f (20%% of the fee curve on %.0f maker shares)"
+              % (paid, rebate, maker_shares))
+        if spent:
+            print("net after fees and rebate $%+.2f (%+.2f%% of spent), %+.3f per traded window"
+                  % (pnl - paid + rebate, 100 * (pnl - paid + rebate) / spent, (pnl - paid + rebate) / len(traded)))
     if mode == "live":
         for name, xs in latency.items():
             if xs:

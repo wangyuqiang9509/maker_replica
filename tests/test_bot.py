@@ -76,7 +76,8 @@ class EngineTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.path = Path(self.tmp.name) / "j.jsonl"
         self.ex = FakeLive()
-        self.bot = b.Bot(self.ex, q.Params(), ["5m"], b.Journal(self.path), 15, None)
+        # improve=True keeps the expected prices one tick inside the spread; the default joins the bid.
+        self.bot = b.Bot(self.ex, q.Params(improve=True), ["5m"], b.Journal(self.path), 15, None)
         self.bot.spot.push(80000.0, time.time())
         for p in (mock.patch.object(b, "REDEEM_DELAY_SECS", 0), mock.patch("builtins.print")):
             p.start()
@@ -215,6 +216,24 @@ class SpotPullTests(EngineTests):
             self.assertNotIn("take", [c[0] for c in self.ex.calls])
             self.assertEqual(self.events("take")[0]["error"], "resting bid already matched")
             self.assertEqual(w.last_sync, 0.0)                              # sync now: the fill is on its way
+        run(go())
+
+    def test_stop_rule_waits_out_the_naked_period_then_takes(self):
+        async def go():
+            self.bot.p = q.Params(improve=True, stop_pair=1.25, stop_after_secs=20)
+            w = self.window(up=(0.18, 0.20), down=(0.78, 0.80))
+            self.bot.windows[w.m["slug"]] = w
+            self.ex.fills["0xc"][("t", "x")] = ("Up", "BUY", 6.0, 0.40, "maker")
+            t0 = time.time()
+            await self.bot.reconcile(w, t0)
+            self.assertNotIn("take", [c[0] for c in self.ex.calls])
+            self.assertAlmostEqual(w.naked_since, t0)
+            await self.bot.reconcile(w, t0 + 25)
+            self.assertIn(("take", "Down", 0.80, 6), self.ex.calls)
+            self.assertEqual(self.events("take")[0]["rule"], "stop")
+            self.ex.fills["0xc"][("t", "y")] = ("Down", "BUY", 6.0, 0.80, "taker")
+            await self.bot.reconcile(w, t0 + 40)
+            self.assertIsNone(w.naked_since)                                  # level again
         run(go())
 
     def test_btc_pull_leaves_the_hedge_bid_alone(self):

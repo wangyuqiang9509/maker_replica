@@ -140,3 +140,51 @@ host at this size.
 - 100 windows (about 8 hours), then decide.
 - `MR_MAX_LOSS_USD` stays at 15 on a $50 account.
 - Stop early if leftover loss per share > 25 c after 50 windows.
+
+## The full day (2026-10-19) and the maker rebate
+
+Public data for the wallet, 05:35–12:53 UTC, every version of the bot plus two manual trades:
+
+| | |
+|---|---|
+| windows traded | 67 (58 with both sides) |
+| fills | 310, of which 300 maker (1,461 shares, $642) and 10 taker (77 shares, $36) |
+| settlement PnL before fees | **−$50.75** (−$0.76 per window) |
+| taker fees paid | −$1.01 |
+| maker rebate credited 00:48 UTC next day | **+$4.38** (`MAKER_REBATE`) |
+
+The rebate is exactly 20.0% of the crypto fee curve `0.07 × p × (1 − p)` over our maker
+shares, so the Maker Rebates Program is live and `./run.sh summary` now estimates it
+(`fees:` and `net after fees and rebate` lines). The reference wallet's `MAKER_REBATE`
+entries are $400–3,000 a day ($96k over the last 100 days): most of its income is this
+rebate on ~$100k of maker volume a day, with trading itself near break-even.
+
+What that means at this size: 22 maker shares per window pay about 6.5 c per window, or
+roughly $19 a day if every 5m window is quoted. "Lose nothing on the quotes, keep the
+rebate" therefore needs the settlement PnL to stay above about −6 c per window. The day
+above ran at −76 c; the last 44 windows (two fixes in) at −35 c.
+
+## Changes for the next run (2026-10-20)
+
+Three of the four levers from the audit, all off real money until a paper run passes:
+
+1. **Join the queue** (`MR_IMPROVE=0`, now the default). Stepping one tick inside the
+   spread put the bot alone at the front: every sweep hit it first and in full. At the
+   best bid it sits behind whoever was there.
+2. **Pace the budget** (`MR_PACE_SECS=180`, new). Live, two pairs at the opening price
+   used the $12 inside 80 s and the window was over for us. After the first fill,
+   bids that add one-sided exposure only get `MR_MAX_MARKET_USD × secs_in / 180`; the
+   hedge bid is never paced. The second pair then comes after ~2 minutes, where the
+   reference wallet buys its cheap shares (24% of its shares below 0.10).
+3. **Optional loss stop** (`MR_STOP_PAIR`, off by default). After `MR_STOP_AFTER_SECS`
+   naked with the other side's ask at `MR_STOP_PRICE` or more, the pair is completed at a
+   loss up to `MR_STOP_PAIR`. It bounds a naked window (−25 c/share instead of −45 c)
+   and does not improve the expectation; the journal marks such takes `rule: stop`.
+
+Not done: hosting the bot in AWS eu-west-1 (the fourth lever; stale-bid exposure 474 ms
+from Tokyo against ~250 ms for the reference wallet).
+
+Acceptance for the paper run (100 windows, `./run.sh summary`): leftover loss ≤ 15 c per
+share, leftover/pairs ≤ 0.5, locked ≥ 6 c per pair, and `net after fees and rebate` per
+traded window ≥ 0. Paper fills are stricter than live (the ask must trade through the bid),
+so a paper pass is necessary, not sufficient.
